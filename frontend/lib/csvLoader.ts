@@ -1,95 +1,119 @@
 /**
- * CSV loader utilities for BiaConnect Dashboard.
+ * CSV loader for BiaConnect Dashboard.
  *
- * TODO: Connect these functions to the real output files produced by
- *       `python src/main.py ...` once they have been generated.
+ * Reads pre-generated pipeline output files from:
+ *   /dashboard_exports/<filename>
  *
- * Planned file paths (relative to project root):
- *   outputs/dashboard_exports/participant_index_filtered.csv
- *   outputs/dashboard_exports/synapse_presence_filtered.csv
- *   outputs/dashboard_exports/session_manifest_filtered.csv
- *   outputs/dashboard_exports/redcap_daily_outcomes.csv
- *   outputs/dashboard_exports/metric_bins_observed_filtered.csv
- *   outputs/dashboard_exports/linked_timegrid_filtered.csv
+ * Files must be placed in frontend/public/dashboard_exports/ by running:
+ *   python src/main.py ... --copy-to-frontend
  *
- * For Next.js on Vercel, these files need to be served as static assets
- * placed under `frontend/public/dashboard_exports/` and fetched via
- * `fetch('/dashboard_exports/<filename>')`.
- *
- * For a local research setup, a simple Express/Flask API endpoint could
- * serve them from the filesystem outside the Next.js public dir.
+ * Each loader returns null when the file is unavailable (404 or network error),
+ * so the calling page can fall back to mock data and show the correct badge.
  */
 
 import type {
   ParticipantIndexRow,
   SynapsePresenceRow,
   SessionManifestRow,
-  RedcapOutcomesRow,
+  SelfReportOutcomesRow,
   MetricBinsRow,
   LinkedTimegridRow,
 } from './types'
 
-// ─── Minimal CSV parser ──────────────────────────────────────────────────────
+// ─── CSV parser ───────────────────────────────────────────────────────────────
+// Handles quoted fields, NA/NaN/None → null, numeric coercion.
+
+function parseCSVLine(line: string): string[] {
+  const result: string[] = []
+  let cur = ''
+  let inQuote = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (ch === '"') {
+      inQuote = !inQuote
+    } else if (ch === ',' && !inQuote) {
+      result.push(cur)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  result.push(cur)
+  return result
+}
 
 function parseCSV<T>(text: string): T[] {
-  const lines = text.trim().split('\n')
+  const lines = text.replace(/\r\n/g, '\n').trim().split('\n')
   if (lines.length < 2) return []
-  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''))
-  return lines.slice(1).map(line => {
-    const values = line.split(',').map(v => v.trim().replace(/^"|"$/g, ''))
-    const obj: Record<string, string | number | null> = {}
-    headers.forEach((h, i) => {
-      const raw = values[i] ?? ''
-      if (raw === '' || raw === 'NA' || raw === 'NaN' || raw === 'None') {
+  const headers = parseCSVLine(lines[0]).map(h => h.trim())
+  const rows: T[] = []
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim()
+    if (!line) continue
+    const values = parseCSVLine(line)
+    const obj: Record<string, string | number | boolean | null> = {}
+    headers.forEach((h, idx) => {
+      const raw = (values[idx] ?? '').trim()
+      if (raw === '' || raw === 'NA' || raw === 'NaN' || raw === 'None' || raw === 'NaT') {
         obj[h] = null
-      } else if (!isNaN(Number(raw))) {
+      } else if (raw === 'True' || raw === 'true') {
+        obj[h] = true
+      } else if (raw === 'False' || raw === 'false') {
+        obj[h] = false
+      } else if (!isNaN(Number(raw)) && raw !== '') {
         obj[h] = Number(raw)
       } else {
         obj[h] = raw
       }
     })
-    return obj as T
-  })
+    rows.push(obj as T)
+  }
+  return rows
 }
 
-async function fetchCSV<T>(publicPath: string): Promise<T[]> {
-  const res = await fetch(publicPath)
-  if (!res.ok) throw new Error(`Failed to load ${publicPath}: ${res.status}`)
-  const text = await res.text()
-  return parseCSV<T>(text)
+async function fetchCSV<T>(publicPath: string): Promise<T[] | null> {
+  try {
+    const res = await fetch(publicPath, { cache: 'no-store' })
+    if (!res.ok) return null   // file not yet generated
+    const text = await res.text()
+    const rows = parseCSV<T>(text)
+    return rows.length > 0 ? rows : null
+  } catch {
+    return null
+  }
 }
 
-// ─── Public loader functions ──────────────────────────────────────────────────
-// Place generated CSV files under frontend/public/dashboard_exports/ and
-// un-comment the fetch call below. While no files exist yet, each function
-// falls back gracefully and returns an empty array.
+// ─── Public loaders ───────────────────────────────────────────────────────────
+// Each returns the parsed rows or null (file unavailable → use mock data).
 
-export async function loadParticipantIndex(): Promise<ParticipantIndexRow[]> {
-  // TODO: return fetchCSV<ParticipantIndexRow>('/dashboard_exports/participant_index_filtered.csv')
-  return []
+export async function loadParticipantIndex(): Promise<ParticipantIndexRow[] | null> {
+  return fetchCSV<ParticipantIndexRow>('/dashboard_exports/participant_index_filtered.csv')
 }
 
-export async function loadSynapsePresence(): Promise<SynapsePresenceRow[]> {
-  // TODO: return fetchCSV<SynapsePresenceRow>('/dashboard_exports/synapse_presence_filtered.csv')
-  return []
+export async function loadSelfReportOutcomes(): Promise<SelfReportOutcomesRow[] | null> {
+  return fetchCSV<SelfReportOutcomesRow>('/dashboard_exports/self_report_daily_outcomes.csv')
 }
 
-export async function loadSessionManifest(): Promise<SessionManifestRow[]> {
-  // TODO: return fetchCSV<SessionManifestRow>('/dashboard_exports/session_manifest_filtered.csv')
-  return []
+export async function loadSynapsePresence(): Promise<SynapsePresenceRow[] | null> {
+  return fetchCSV<SynapsePresenceRow>('/dashboard_exports/synapse_presence_filtered.csv')
 }
 
-export async function loadRedcapOutcomes(): Promise<RedcapOutcomesRow[]> {
-  // TODO: return fetchCSV<RedcapOutcomesRow>('/dashboard_exports/redcap_daily_outcomes.csv')
-  return []
+/** Load a per-participant detail CSV from its public path. Returns null if unavailable. */
+export async function loadDetailCSV<T>(publicPath: string): Promise<T[] | null> {
+  return fetchCSV<T>(publicPath)
 }
 
+/** Full session manifest — 300 MB; not auto-loaded on page start. Use loadDetailCSV instead. */
+export async function loadSessionManifest(): Promise<SessionManifestRow[] | null> {
+  return fetchCSV<SessionManifestRow>('/dashboard_exports/session_manifest_filtered.csv')
+}
+
+/** Metric bins are optional (require --download --parse). Always returns an array; never null. */
 export async function loadMetricBins(): Promise<MetricBinsRow[]> {
-  // TODO: return fetchCSV<MetricBinsRow>('/dashboard_exports/metric_bins_observed_filtered.csv')
-  return []
+  const rows = await fetchCSV<MetricBinsRow>('/dashboard_exports/biaffect_metric_bins_filtered.csv')
+  return rows ?? []
 }
 
-export async function loadLinkedTimegrid(): Promise<LinkedTimegridRow[]> {
-  // TODO: return fetchCSV<LinkedTimegridRow>('/dashboard_exports/linked_timegrid_filtered.csv')
-  return []
+export async function loadLinkedTimegrid(): Promise<LinkedTimegridRow[] | null> {
+  return fetchCSV<LinkedTimegridRow>('/dashboard_exports/linked_timegrid_filtered.csv')
 }

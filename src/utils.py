@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import zipfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -35,6 +36,7 @@ from commonconst import (
     DEFAULT_MAX_ROWS_PER_PARTICIPANT,
     DEFAULT_SORT_MANIFEST_BY,
     EXTRACTED_DIR,
+    FRONTEND_DASHBOARD_EXPORT_DIR,
     ID_RENAME_MAP,
     ID_REQUIRED_COLUMNS,
     IPHONE_TABLE_ID,
@@ -127,6 +129,132 @@ def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | Non
         if c.lower() in lower_to_original:
             return lower_to_original[c.lower()]
     return None
+
+
+def mask_health_code(hc: Any) -> str:
+    """Return a display-safe masked health_code: 'abcdef12' → 'abc***f12'.
+    Never call this with a real health_code in a public log or UI string directly —
+    only use the returned masked value.
+    """
+    s = str(hc).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return "***"
+    if len(s) <= 4:
+        return s[:1] + "***"
+    if len(s) <= 8:
+        return s[:2] + "***" + s[-2:]
+    return s[:3] + "***" + s[-3:]
+
+
+def export_participant_details(
+    participant_df: pd.DataFrame,
+    manifest_df: pd.DataFrame,
+    timegrid_df: pd.DataFrame,
+    backend_out_dir: str | Path,
+    frontend_out_dir: str | Path,
+) -> pd.DataFrame:
+    """Export per-participant session manifest and linked timegrid CSVs.
+
+    Creates:
+      <backend_out_dir>/participant_details/<key>_session_manifest.csv
+      <backend_out_dir>/participant_details/<key>_linked_timegrid.csv
+    And mirrors both trees into <frontend_out_dir>/participant_details/.
+
+    The safe participant_detail_key is the record_id integer (e.g. "127084").
+    Falls back to "alias_<alias>" or "part_<index>" if record_id is absent.
+    Full health_code is dropped from public detail files; health_code_masked is kept.
+
+    Returns an updated participant_df with three new columns:
+      participant_detail_key, session_manifest_detail_path, linked_timegrid_detail_path
+    """
+    backend_out_dir = Path(backend_out_dir)
+    frontend_out_dir = Path(frontend_out_dir)
+    detail_backend  = ensure_dir(backend_out_dir  / "participant_details")
+    detail_frontend = ensure_dir(frontend_out_dir / "participant_details")
+
+    out = participant_df.copy()
+
+    def make_key(row: pd.Series, fallback_idx: int) -> str:
+        rid = row.get("record_id")
+        if pd.notna(rid):
+            return str(int(rid))
+        alias = row.get("alias")
+        if pd.notna(alias):
+            return f"alias_{int(alias)}"
+        return f"part_{fallback_idx}"
+
+    out["participant_detail_key"]         = [make_key(r, i) for i, r in out.iterrows()]
+    out["session_manifest_detail_path"]   = ""
+    out["linked_timegrid_detail_path"]    = ""
+
+    has_manifest  = not manifest_df.empty  and "health_code" in manifest_df.columns
+    has_timegrid  = not timegrid_df.empty  and "health_code" in timegrid_df.columns
+
+    total = len(out)
+    for i, (idx, row) in enumerate(out.iterrows(), 1):
+        hc  = str(row["health_code"])
+        key = str(row["participant_detail_key"])
+        print(f"  [{i}/{total}] exporting detail for key={key}")
+
+        if has_manifest:
+            sub = manifest_df[manifest_df["health_code"].astype(str).eq(hc)].copy()
+            if not sub.empty:
+                if "health_code_masked" not in sub.columns:
+                    sub["health_code_masked"] = sub["health_code"].apply(mask_health_code)
+                sub = sub.drop(columns=["health_code"], errors="ignore")
+                fname = f"{key}_session_manifest.csv"
+                sub.to_csv(detail_backend / fname, index=False)
+                shutil.copy2(detail_backend / fname, detail_frontend / fname)
+                out.at[idx, "session_manifest_detail_path"] = (
+                    f"/dashboard_exports/participant_details/{fname}"
+                )
+
+        if has_timegrid:
+            sub = timegrid_df[timegrid_df["health_code"].astype(str).eq(hc)].copy()
+            if not sub.empty:
+                if "health_code_masked" not in sub.columns:
+                    sub["health_code_masked"] = sub["health_code"].apply(mask_health_code)
+                sub = sub.drop(columns=["health_code"], errors="ignore")
+                fname = f"{key}_linked_timegrid.csv"
+                sub.to_csv(detail_backend / fname, index=False)
+                shutil.copy2(detail_backend / fname, detail_frontend / fname)
+                out.at[idx, "linked_timegrid_detail_path"] = (
+                    f"/dashboard_exports/participant_details/{fname}"
+                )
+
+    return out
+
+
+def copy_exports_to_frontend(
+    out_dir: str | Path,
+    frontend_dir: str | Path | None = None,
+    filenames: list[str] | None = None,
+) -> list[Path]:
+    """Copy CSV exports from out_dir to the Next.js public directory.
+
+    Files are placed under frontend/public/dashboard_exports/ so that
+    Next.js can serve them at /dashboard_exports/<filename>.
+    Returns list of destination paths that were successfully copied.
+    """
+    from commonconst import DASHBOARD_FRONTEND_FILES
+
+    out_dir = Path(out_dir)
+    if frontend_dir is None:
+        frontend_dir = FRONTEND_DASHBOARD_EXPORT_DIR
+    frontend_dir = ensure_dir(frontend_dir)
+
+    targets = filenames if filenames else DASHBOARD_FRONTEND_FILES
+    copied: list[Path] = []
+    for fname in targets:
+        src = out_dir / fname
+        dst = frontend_dir / fname
+        if src.exists():
+            shutil.copy2(src, dst)
+            copied.append(dst)
+            print(f"  copied {fname} → {dst}")
+        else:
+            print(f"  skipped (not found): {src}")
+    return copied
 
 # ---------------------------------------------------------------------
 # ID linkage and REDCap outcomes
@@ -243,6 +371,31 @@ def build_daily_outcomes(report_csv: str | Path, ids_df: pd.DataFrame) -> pd.Dat
     return out
 
 
+def load_self_report(report_csv: str | Path, ids_df: pd.DataFrame) -> pd.DataFrame:
+    """Load report.csv and link each row to a health_code via the participant ID file.
+
+    Linkage path: report.csv[redcap_survey_identifier] → ids_df[record_id_str] → health_code.
+    Strictly health_code-based after join; no downstream code should re-join on record_id.
+    Returns a DataFrame with a populated `health_code` column and a `health_code_masked` column.
+    Falls back gracefully if the report file is missing or the identifier column is absent.
+    """
+    report_path = Path(report_csv)
+    if not report_path.exists():
+        print(f"Self-report file not found, continuing without it: {report_path}")
+        return pd.DataFrame()
+    try:
+        df = build_daily_outcomes(report_path, ids_df)
+    except Exception as exc:
+        print(f"WARNING: Could not load self-report data: {exc}")
+        return pd.DataFrame()
+    # Add masked health_code column for safe logging/export.
+    if "health_code" in df.columns:
+        df["health_code_masked"] = df["health_code"].apply(
+            lambda hc: mask_health_code(hc) if pd.notna(hc) else "***"
+        )
+    return df
+
+
 def build_participant_index(ids_df: pd.DataFrame, outcomes_df: pd.DataFrame | None = None) -> pd.DataFrame:
     out = ids_df.copy()
     if outcomes_df is None or outcomes_df.empty:
@@ -277,6 +430,159 @@ def build_participant_index(ids_df: pd.DataFrame, outcomes_df: pd.DataFrame | No
     return out
 
 
+def build_healthcode_linkage(
+    ids_df: pd.DataFrame,
+    self_report_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Build participant index linked strictly by health_code.
+
+    Aggregates self-report statistics per health_code and left-joins to the
+    participant ID table. Adds health_code_masked for safe display.
+    Does NOT contact Synapse; has_synapse/synapse_sessions are added later
+    by merging with the presence summary.
+    """
+    out = ids_df.copy()
+    out["health_code_masked"] = out["health_code"].apply(mask_health_code)
+    # Synapse columns — populated later after presence check.
+    out["has_synapse"] = False
+    out["synapse_sessions"] = 0
+    out["first_synapse_date"] = pd.NaT
+    out["last_synapse_date"] = pd.NaT
+    out["synapse_source_table"] = pd.NA
+
+    if self_report_df is None or self_report_df.empty:
+        out["has_self_report"] = False
+        out["self_report_rows"] = 0
+        out["self_report_days"] = 0
+        out["first_self_report_date"] = pd.NaT
+        out["last_self_report_date"] = pd.NaT
+        return out
+
+    tmp = self_report_df.dropna(subset=["health_code"]).copy()
+    tmp["date"] = pd.to_datetime(tmp.get("date"), errors="coerce").dt.normalize()
+
+    if tmp.empty:
+        out["has_self_report"] = False
+        out["self_report_rows"] = 0
+        out["self_report_days"] = 0
+        out["first_self_report_date"] = pd.NaT
+        out["last_self_report_date"] = pd.NaT
+        return out
+
+    summary = (
+        tmp.groupby("health_code", dropna=False)
+        .agg(
+            self_report_rows=("date", "size"),
+            self_report_days=("date", "nunique"),
+            first_self_report_date=("date", "min"),
+            last_self_report_date=("date", "max"),
+        )
+        .reset_index()
+    )
+    summary["has_self_report"] = summary["self_report_rows"].gt(0)
+
+    out = out.merge(summary, on="health_code", how="left")
+    out["has_self_report"] = out["has_self_report"].fillna(False)
+    for c in ["self_report_rows", "self_report_days"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+    return out
+
+
+def merge_synapse_into_index(
+    participant_df: pd.DataFrame,
+    presence_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge Synapse presence statistics into the participant index by health_code."""
+    if presence_df.empty:
+        return participant_df.copy()
+
+    matched = presence_df[presence_df["status"].astype(str).str.lower().eq("matched")].copy()
+    if matched.empty:
+        return participant_df.copy()
+
+    syn_stats = (
+        matched.groupby("health_code", dropna=False)
+        .agg(
+            synapse_sessions=("match_count", "sum"),
+            synapse_source_table=("source_label", "first"),
+        )
+        .reset_index()
+    )
+    syn_stats["has_synapse"] = True
+
+    # session date range comes from the manifest if available; leave NaT for now
+    syn_stats["first_synapse_date"] = pd.NaT
+    syn_stats["last_synapse_date"] = pd.NaT
+
+    out = participant_df.copy()
+    # Drop old synapse columns before merge to avoid duplicates
+    for col in ["has_synapse", "synapse_sessions", "synapse_source_table",
+                "first_synapse_date", "last_synapse_date"]:
+        if col in out.columns:
+            out = out.drop(columns=[col])
+
+    out = out.merge(syn_stats, on="health_code", how="left")
+    out["has_synapse"] = out["has_synapse"].fillna(False)
+    out["synapse_sessions"] = pd.to_numeric(out["synapse_sessions"], errors="coerce").fillna(0).astype(int)
+    return out
+
+
+def compute_synapse_date_range(manifest_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute first and last Synapse session date per health_code from the manifest.
+
+    Returns a DataFrame with columns:
+      health_code, first_synapse_date (str YYYY-MM-DD), last_synapse_date (str YYYY-MM-DD)
+
+    Tries these date columns in priority order:
+      uploadDate, createdOn, session_date, startedOn, startTime, session_start,
+      timestamp, created_on, created_at
+
+    Prints a warning listing available columns if none of the candidates exist.
+    """
+    if manifest_df.empty:
+        return pd.DataFrame(columns=["health_code", "first_synapse_date", "last_synapse_date"])
+
+    # normalize_manifest_dates already resolves uploadDate and createdOn into session_date
+    df = normalize_manifest_dates(manifest_df.copy())
+
+    # Priority: session_date (resolved above), then raw candidates
+    date_candidates = [
+        "session_date", "uploadDate_dt", "createdOn_dt",
+        "startedOn", "startTime", "session_start",
+        "timestamp", "created_on", "created_at",
+    ]
+    date_col: str | None = None
+    for cand in date_candidates:
+        if cand in df.columns:
+            parsed = pd.to_datetime(df[cand], errors="coerce")
+            if parsed.notna().any():
+                date_col = cand
+                df["_synapse_date"] = parsed.dt.normalize()
+                break
+
+    if date_col is None:
+        available = ", ".join(str(c) for c in manifest_df.columns.tolist())
+        print(f"WARNING: No usable date column found in manifest. Available: {available}")
+        return pd.DataFrame(columns=["health_code", "first_synapse_date", "last_synapse_date"])
+
+    date_range = (
+        df.dropna(subset=["health_code", "_synapse_date"])
+        .groupby("health_code", dropna=False)
+        .agg(
+            first_synapse_date=("_synapse_date", "min"),
+            last_synapse_date=("_synapse_date", "max"),
+        )
+        .reset_index()
+    )
+    date_range["first_synapse_date"] = pd.to_datetime(
+        date_range["first_synapse_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    date_range["last_synapse_date"] = pd.to_datetime(
+        date_range["last_synapse_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    return date_range
+
+
 def apply_participant_filters(
     participant_df: pd.DataFrame,
     record_ids: list[int] | None = None,
@@ -284,8 +590,13 @@ def apply_participant_filters(
     health_codes: list[str] | None = None,
     device_type: str | None = None,
     require_redcap: bool = False,
+    require_self_report: bool = False,
+    require_synapse: bool = False,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    max_rows_per_participant: int = 0,
 ) -> pd.DataFrame:
-    """Filter participants before any Synapse calls."""
+    """Filter participants. All ID/metadata filters applied after linkage is built."""
     df = participant_df.copy()
 
     if record_ids:
@@ -297,8 +608,34 @@ def apply_participant_filters(
         df = df[df["health_code"].astype(str).str.strip().isin(hc)]
     if device_type and device_type.lower() != "all":
         df = df[df["device_type"].eq(device_type.lower())]
-    if require_redcap and "has_redcap_outcome" in df.columns:
-        df = df[df["has_redcap_outcome"].eq(1)]
+
+    # require_redcap and require_self_report are equivalent — check whichever column exists.
+    if require_redcap or require_self_report:
+        if "has_self_report" in df.columns:
+            df = df[df["has_self_report"].eq(True)]
+        elif "has_redcap_outcome" in df.columns:
+            df = df[df["has_redcap_outcome"].eq(1)]
+
+    if require_synapse and "has_synapse" in df.columns:
+        df = df[df["has_synapse"].eq(True)]
+
+    if start_date and "first_self_report_date" in df.columns:
+        start_dt = pd.to_datetime(start_date, errors="coerce")
+        if pd.notna(start_dt):
+            df = df[
+                pd.to_datetime(df["last_self_report_date"], errors="coerce").ge(start_dt)
+                | pd.to_datetime(df["last_synapse_date"], errors="coerce").ge(start_dt)
+            ]
+    if end_date and "last_self_report_date" in df.columns:
+        end_dt = pd.to_datetime(end_date, errors="coerce")
+        if pd.notna(end_dt):
+            df = df[
+                pd.to_datetime(df["first_self_report_date"], errors="coerce").le(end_dt)
+                | pd.to_datetime(df["first_synapse_date"], errors="coerce").le(end_dt)
+            ]
+
+    if max_rows_per_participant and max_rows_per_participant > 0:
+        df = df.head(max_rows_per_participant)
 
     return df.reset_index(drop=True)
 
@@ -405,13 +742,35 @@ def fetch_manifest_rows_for_healthcode(syn: Any, table_id: str, matched_hc: str)
 
 
 def normalize_manifest_dates(manifest_df: pd.DataFrame) -> pd.DataFrame:
+    """Parse Synapse manifest date columns into consistent datetime columns.
+
+    createdOn is a Unix millisecond timestamp (e.g. 1748640572354). Standard
+    pd.to_datetime() treats bare integers as nanoseconds and produces 1970-01-01.
+    We use parse_biaffect_timestamp() which detects ms vs s automatically.
+
+    uploadDate is a clean "YYYY-MM-DD" string — parsed normally and preferred
+    for session_date because it is always the calendar date of the session.
+    """
     df = manifest_df.copy()
     for col in df.columns:
         if df[col].dtype == "object":
             df[col] = df[col].fillna("").astype(str).str.strip()
-    df["createdOn_dt"] = pd.to_datetime(df.get("createdOn"), errors="coerce")
-    df["uploadDate_dt"] = pd.to_datetime(df.get("uploadDate"), errors="coerce")
-    df["session_start_dt"] = df["createdOn_dt"].combine_first(df["uploadDate_dt"])
+
+    # createdOn: Unix ms timestamp → use ms-aware parser
+    if "createdOn" in df.columns:
+        df["createdOn_dt"] = parse_biaffect_timestamp(
+            pd.to_numeric(df["createdOn"].replace("", np.nan), errors="coerce")
+        )
+    else:
+        df["createdOn_dt"] = pd.NaT
+
+    # uploadDate: standard "YYYY-MM-DD" or ISO string → direct parse
+    df["uploadDate_dt"] = pd.to_datetime(
+        df.get("uploadDate", pd.Series(dtype="object")), errors="coerce"
+    )
+
+    # Prefer uploadDate (clean calendar date) over createdOn (raw epoch ms)
+    df["session_start_dt"] = df["uploadDate_dt"].combine_first(df["createdOn_dt"])
     df["session_date"] = df["session_start_dt"].dt.normalize()
     return df
 
@@ -804,6 +1163,91 @@ def build_observed_metric_bins(keylogs: pd.DataFrame, accels: pd.DataFrame) -> p
         how="outer",
     ).sort_values(["participant", "date", "bin_index"]).reset_index(drop=True)
 
+def build_biaffect_metric_bins(
+    keylogs: pd.DataFrame,
+    accels: pd.DataFrame,
+    participant_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build participant-labeled 15-min metric bins with standardized column names.
+
+    Output columns:
+      health_code, health_code_masked, record_id, alias, date,
+      bin_index, bin_start, bin_end,
+      observed_minutes,           # 15 if any data in bin, else 0
+      keyboard_session_count,     # distinct Synapse recordIds in bin
+      typing_event_count,         # total keylog events
+      backspace_count,
+      backspace_ratio,
+      mean_inter_key_interval,    # key_duration_mean (ms)
+      median_inter_key_interval,  # key_duration_median (ms)
+      accelerometer_activity_mean,
+      accelerometer_activity_sd,
+      data_coverage_pct           # 1.0 if observed, 0.0 if not (bin-level)
+
+    Columns that cannot be computed from current data are included as null
+    with a code comment below.
+    """
+    base = build_observed_metric_bins(keylogs, accels)
+    if base.empty:
+        return pd.DataFrame()
+
+    # Build lookup: participant label (record_id string) → participant row
+    p_lookup: dict[str, Any] = {}
+    for _, row in participant_df.iterrows():
+        p_lookup[str(row.get("record_id", ""))] = row
+
+    def _get(label: str, field: str) -> Any:
+        row = p_lookup.get(str(label))
+        return row.get(field) if row is not None else None
+
+    out = base.copy()
+    out["record_id"] = out["participant"].apply(lambda p: _get(p, "record_id"))
+    out["alias"] = out["participant"].apply(lambda p: _get(p, "alias"))
+    out["health_code"] = out["participant"].apply(lambda p: _get(p, "health_code"))
+    out["health_code_masked"] = out["health_code"].apply(
+        lambda hc: mask_health_code(hc) if pd.notna(hc) else "***"
+    )
+
+    col_map = {
+        "n_keylogs":          "typing_event_count",
+        "n_backspace":        "backspace_count",
+        "n_sessions_in_bin":  "keyboard_session_count",
+        "key_duration_mean":  "mean_inter_key_interval",
+        "key_duration_median":"median_inter_key_interval",
+        "accelerometer_activity":    "accelerometer_activity_mean",
+        "accelerometer_activity_sd": "accelerometer_activity_sd",
+    }
+    out = out.rename(columns={k: v for k, v in col_map.items() if k in out.columns})
+
+    has_key = out.get("typing_event_count", pd.Series(0, index=out.index)).fillna(0).gt(0)
+    has_acc = out.get("n_accelerations", pd.Series(0, index=out.index)).fillna(0).gt(0)
+    out["observed_minutes"] = (has_key | has_acc).astype(int) * BIN_MINUTES
+    out["data_coverage_pct"] = (out["observed_minutes"] / BIN_MINUTES).round(4)
+
+    # Columns below are null because they cannot currently be derived from the
+    # Session.json summary data (would require raw inter-keystroke timestamps).
+    for null_col in ["mean_inter_key_interval", "median_inter_key_interval"]:
+        if null_col not in out.columns:
+            out[null_col] = np.nan  # not computable from current aggregated keylog data
+
+    keep_cols = [
+        "health_code", "health_code_masked", "record_id", "alias",
+        "date", "bin_index", "bin_start", "bin_end",
+        "observed_minutes", "keyboard_session_count", "typing_event_count",
+        "backspace_count", "backspace_ratio",
+        "mean_inter_key_interval", "median_inter_key_interval",
+        "accelerometer_activity_mean", "accelerometer_activity_sd",
+        "data_coverage_pct",
+    ]
+    for c in keep_cols:
+        if c not in out.columns:
+            out[c] = np.nan
+    return (
+        out[keep_cols]
+        .sort_values(["health_code", "date", "bin_index"])
+        .reset_index(drop=True)
+    )
+
 # ---------------------------------------------------------------------
 # Linked time-grid construction
 # ---------------------------------------------------------------------
@@ -915,5 +1359,25 @@ def build_linked_timegrid(
         if c not in panel.columns:
             panel[c] = np.nan
         panel.loc[panel["n_keylogs"].eq(0), c] = np.nan
+
+    # Convenience flags for the dashboard frontend.
+    panel["has_biaffect_for_bin"] = (
+        panel["has_keylog_observation"].eq(1) | panel["has_accel_observation"].eq(1)
+    ).astype(int)
+
+    # has_self_report_for_day: 1 if any self-report outcome row exists for this date.
+    if "has_redcap_outcome" in panel.columns:
+        day_sr = (
+            panel.groupby(["health_code", "date"], dropna=False)["has_redcap_outcome"]
+            .transform("max")
+            .fillna(0)
+            .astype(int)
+        )
+        panel["has_self_report_for_day"] = day_sr
+    else:
+        panel["has_self_report_for_day"] = 0
+
+    # Add health_code_masked
+    panel["health_code_masked"] = panel["health_code"].apply(mask_health_code)
 
     return panel.sort_values(["record_id", "date", "bin_index"]).reset_index(drop=True)

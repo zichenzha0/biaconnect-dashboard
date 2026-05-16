@@ -14,17 +14,28 @@ from pathlib import Path
 # ---------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # project root (one level above src/)
 
-DATA_DIR = PROJECT_ROOT / "data"
-RAW_DIR = DATA_DIR / "raw"
-INTERIM_DIR = DATA_DIR / "interim"
-PROCESSED_DIR = DATA_DIR / "processed"
+DATA_DIR       = PROJECT_ROOT / "data"
+RAW_DIR        = DATA_DIR / "raw"
+INTERIM_DIR    = DATA_DIR / "interim"
+PROCESSED_DIR  = DATA_DIR / "processed"
 
-OUTPUT_DIR = PROJECT_ROOT / "outputs"
-MANIFEST_DIR = OUTPUT_DIR / "manifests"
-DOWNLOAD_DIR = OUTPUT_DIR / "downloads"
-EXTRACTED_DIR = OUTPUT_DIR / "extracted"
+OUTPUT_DIR          = PROJECT_ROOT / "outputs"
+MANIFEST_DIR        = OUTPUT_DIR / "manifests"
+DOWNLOAD_DIR        = OUTPUT_DIR / "downloads"
+EXTRACTED_DIR       = OUTPUT_DIR / "extracted"
 DASHBOARD_EXPORT_DIR = OUTPUT_DIR / "dashboard_exports"
-QC_DIR = OUTPUT_DIR / "qc"
+QC_DIR              = OUTPUT_DIR / "qc"
+
+# Frontend public directory — Python copies dashboard CSVs here for local serving.
+FRONTEND_DASHBOARD_EXPORT_DIR = PROJECT_ROOT / "frontend" / "public" / "dashboard_exports"
+
+# Default local inputs. Put real data here locally only; never commit them.
+DEFAULT_IDS_XLSX        = RAW_DIR / "BiAffect IDs.xlsx"
+DEFAULT_REDCAP_REPORT_CSV = RAW_DIR / "report.csv"
+
+# Explicit aliases used by new pipeline code.
+IDS_FILE    = RAW_DIR / "BiAffect IDs.xlsx"
+REPORT_FILE = RAW_DIR / "report.csv"
 
 DEFAULT_DIRS = [
     DATA_DIR,
@@ -36,12 +47,9 @@ DEFAULT_DIRS = [
     DOWNLOAD_DIR,
     EXTRACTED_DIR,
     DASHBOARD_EXPORT_DIR,
+    FRONTEND_DASHBOARD_EXPORT_DIR,
     QC_DIR,
 ]
-
-# Default local inputs. Put real data here locally only; never commit them.
-DEFAULT_IDS_XLSX = RAW_DIR / "BiAffect IDs.xlsx"
-DEFAULT_REDCAP_REPORT_CSV = RAW_DIR / "report.csv"
 
 # ---------------------------------------------------------------------
 # Synapse settings
@@ -127,6 +135,7 @@ DEFAULT_SORT_MANIFEST_BY = "createdOn"
 # ---------------------------------------------------------------------
 IDS_CLEAN_FILENAME = "participants_clean.csv"
 DAILY_OUTCOMES_FILENAME = "redcap_daily_outcomes.csv"
+SELF_REPORT_DAILY_OUTCOMES_FILENAME = "self_report_daily_outcomes.csv"
 PARTICIPANT_INDEX_FILENAME = "participant_index_filtered.csv"
 SYNAPSE_PRESENCE_FILENAME = "synapse_presence_filtered.csv"
 SESSION_MANIFEST_FILENAME = "session_manifest_filtered.csv"
@@ -134,7 +143,18 @@ DOWNLOAD_LOG_FILENAME = "download_log_filtered.csv"
 KEYLOGS_LONG_FILENAME = "keylogs_long_filtered.csv"
 ACCELS_LONG_FILENAME = "accelerations_long_filtered.csv"
 METRIC_BINS_FILENAME = "metric_bins_observed_filtered.csv"
+BIAFFECT_METRIC_BINS_FILENAME = "biaffect_metric_bins_filtered.csv"
 LINKED_TIMEGRID_FILENAME = "linked_timegrid_filtered.csv"
+
+# Canonical list of CSVs that the frontend dashboard expects.
+DASHBOARD_FRONTEND_FILES = [
+    PARTICIPANT_INDEX_FILENAME,
+    SELF_REPORT_DAILY_OUTCOMES_FILENAME,
+    SYNAPSE_PRESENCE_FILENAME,
+    SESSION_MANIFEST_FILENAME,
+    BIAFFECT_METRIC_BINS_FILENAME,
+    LINKED_TIMEGRID_FILENAME,
+]
 
 # ---------------------------------------------------------------------
 # Zero / missing interpretation used by dashboard documentation
