@@ -1,0 +1,13 @@
+{
+  "name": "biaconnect-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Root workspace — delegates frontend scripts to frontend/",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "start": "npm --prefix frontend run start",
+    "lint": "npm --prefix frontend run lint",
+    "install:frontend": "npm --prefix frontend install"
+  }
+}

@@ -1,0 +1,61 @@
+# ── Secrets & credentials ──────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Participant data — never commit raw or processed participant files ──
+data/raw/
+data/interim/
+data/processed/
+outputs/
+
+# Keep directory placeholders
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+!outputs/dashboard_exports/.gitkeep
+
+# ── Python ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+*.manifest
+*.spec
+
+# ── Node / Next.js ─────────────────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel
+.next/
+out/
+.vercel
+
+# ── OS / editor ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/settings.json
+.idea/
+
+# ── Jupyter ────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Synapse cache ──────────────────────────────────────────────────────
+.synapseCache/
